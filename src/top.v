@@ -1,3 +1,5 @@
+`include "params.v"
+
 module top (
     input  wire        clk,
     input  wire        reset,
@@ -5,32 +7,56 @@ module top (
     output wire [31:0] dataadr,
     output wire        memwrite
 );
-    // State machine parameters
-    localparam FETCH     = 3'd0;
-    localparam DECODE    = 3'd1;
-    localparam EXECUTE   = 3'd2;
-    localparam MEMORY    = 3'd3;
-    localparam WRITEBACK = 3'd4;
-
+    // State machine
     reg [2:0] state, next_state;
 
-    // Memory and register arrays
-    reg [31:0] instr_mem [0:31];
-    reg [31:0] data_mem  [0:31];
-    reg [31:0] registers [0:31];
+    // Register file
+    wire [31:0] read_data1, read_data2;
+    regfile reg_file (
+        .clk(clk),
+        .reset(reset),
+        .RegWrite(RegWrite),
+        .RegDst(RegDst),
+        .rs(rs),
+        .rt(rt),
+        .rd(rd),
+        .write_data(MemtoReg ? MDR : ALUOut),
+        .read_data1(read_data1),
+        .read_data2(read_data2)
+    );
 
+    // ALU
+    wire [31:0] alu_result;
+    wire        zero;
+    alu alu_unit (
+        .A(read_data1),
+        .B(read_data2),
+        .ALUSrc(ALUSrc),
+        .imm(imm),
+        .ALUOp(ALUOp),
+        .funct(instr_reg[5:0]),
+        .alu_result(alu_result),
+        .zero(zero)
+    );
+
+    // Memory (kept as arrays for now)
+    reg [31:0] instr_mem [0:`MEM_SIZE-1];
+    reg [31:0] data_mem  [0:`MEM_SIZE-1];
+
+    // Instruction register and pipeline registers
     reg [31:0] pc;
     reg [31:0] instr_reg;
-    reg [31:0] A, B;
     reg [31:0] ALUOut;
     reg [31:0] MDR;
 
+    // Control signals from controller
     wire       RegDst, Branch, MemRead, MemtoReg, ALUSrc, RegWrite, Jump;
     wire [1:0] ALUOp;
     wire       MemWrite;
     wire       PCWrite;
     wire       IRWrite;
 
+    // Instruction fields
     wire [5:0] opcode = instr_reg[31:26];
     wire [4:0] rs     = instr_reg[25:21];
     wire [4:0] rt     = instr_reg[20:16];
@@ -38,22 +64,18 @@ module top (
     wire [15:0] imm   = instr_reg[15:0];
     wire [31:0] sign_ext_imm = {{16{imm[15]}}, imm};
 
-    reg [31:0] alu_result;
-    reg        zero;
-
     integer i;
 
     initial begin
         pc    = 32'd0;
-        state = FETCH;
+        state = `FETCH;
 
-        for (i=0; i<32; i=i+1) begin
-            registers[i] = 32'd0;
-            data_mem[i]  = 32'd0;
+        for (i = 0; i < `MEM_SIZE; i = i + 1) begin
             instr_mem[i] = 32'd0;
+            data_mem[i]  = 32'd0;
         end
 
-        // Initialize instruction memory with test program
+        // Test program
         instr_mem[0]  = 32'h20020007;  // addi $2, $0, 5
         instr_mem[1]  = 32'h2003000c;  // addi $3, $0, 12
         instr_mem[2]  = 32'h2067fff7;  // addi $7, $3, -9
@@ -74,7 +96,7 @@ module top (
         instr_mem[17] = 32'hac020054;  // sw   $2, 84($0)
     end
 
-    wire [31:0] instr_mem_out = instr_mem[ pc[6:2] ];
+    wire [31:0] instr_mem_out = instr_mem[pc[6:2]];
 
     Control control_unit (
         .OpCode  (opcode),
@@ -92,83 +114,59 @@ module top (
         .IRWrite (IRWrite)
     );
 
+    // State machine
     always @(posedge clk or posedge reset) begin
         if (reset)
-            state <= FETCH;
+            state <= `FETCH;
         else
             state <= next_state;
     end
 
     always @(*) begin
         case (state)
-            FETCH:    next_state = DECODE;
-            DECODE:   next_state = EXECUTE;
-            EXECUTE: begin
+            `FETCH:    next_state = `DECODE;
+            `DECODE:   next_state = `EXECUTE;
+            `EXECUTE: begin
                 if (MemRead || MemWrite)
-                    next_state = MEMORY;
+                    next_state = `MEMORY;
                 else if (RegWrite)
-                    next_state = WRITEBACK;
+                    next_state = `WRITEBACK;
                 else
-                    next_state = FETCH;
+                    next_state = `FETCH;
             end
-            MEMORY: begin
+            `MEMORY: begin
                 if (RegWrite)
-                    next_state = WRITEBACK;
+                    next_state = `WRITEBACK;
                 else
-                    next_state = FETCH;
+                    next_state = `FETCH;
             end
-            WRITEBACK: next_state = FETCH;
-            default:   next_state = FETCH;
+            `WRITEBACK: next_state = `FETCH;
+            default:   next_state = `FETCH;
         endcase
     end
 
-    always @(*) begin
-        alu_result = 32'b0;
-        zero       = 1'b0;
-
-        case (ALUOp)
-            2'b00: alu_result = A + (ALUSrc ? sign_ext_imm : B);
-            2'b01: begin
-                alu_result = A - B;
-                zero       = (alu_result == 0);
-            end
-            2'b10: begin
-                case (instr_reg[5:0])
-                    6'b100000: alu_result = A + B;   // ADD
-                    6'b100010: alu_result = A - B;   // SUB
-                    6'b100100: alu_result = A & B;   // AND
-                    6'b100101: alu_result = A | B;   // OR
-                    6'b101010: alu_result = (A < B) ? 32'd1 : 32'd0; // SLT
-                    default:   alu_result = 32'd0;
-                endcase
-            end
-            default: alu_result = 32'd0;
-        endcase
-    end
-
+    // Pipeline stages
     always @(posedge clk) begin
         if (!reset) begin
             case (state)
-                FETCH: begin
+                `FETCH: begin
                     if (IRWrite)
                         instr_reg <= instr_mem_out;
                 end
-                DECODE: begin
-                    A <= registers[rs];
-                    B <= registers[rt];
+                `DECODE: begin
+                    // Use read_data1, read_data2 from regfile
                 end
-                EXECUTE: begin
+                `EXECUTE: begin
                     ALUOut <= alu_result;
                 end
-                MEMORY: begin
+                `MEMORY: begin
                     if (MemRead)
-                        MDR <= data_mem[ ALUOut[31:2] ];
+                        MDR <= data_mem[ALUOut[31:2]];
                     if (MemWrite)
-                        data_mem[ ALUOut[31:2] ] <= B;
+                        data_mem[ALUOut[31:2]] <= read_data2;
                 end
-                WRITEBACK: begin
-                    if (RegWrite)
-                        registers[(RegDst ? rd : rt)] <= (MemtoReg ? MDR : ALUOut);
+                `WRITEBACK: begin
+                    // Handled by regfile
                 end
             endcase
         end
@@ -176,7 +174,7 @@ module top (
 
     wire [31:0] pc_plus4      = pc + 4;
     wire [31:0] branch_target = pc_plus4 + (sign_ext_imm << 2);
-    wire [31:0] jump_target   = { pc_plus4[31:28], instr_reg[25:0], 2'b00 };
+    wire [31:0] jump_target   = {pc_plus4[31:28], instr_reg[25:0], 2'b00};
 
     always @(posedge clk or posedge reset) begin
         if (reset)
@@ -191,8 +189,8 @@ module top (
         end
     end
 
-    assign writedata = B;
+    assign writedata = read_data2;
     assign dataadr   = ALUOut;
-    assign memwrite  = (state == MEMORY) && MemWrite;
+    assign memwrite  = (state == `MEMORY) && MemWrite;
 
 endmodule
